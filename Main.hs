@@ -1,5 +1,4 @@
 import Control.Applicative
-import Control.DeepSeq
 import Data.List
 import Data.Char
 
