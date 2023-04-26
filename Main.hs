@@ -1,6 +1,6 @@
 import Control.Applicative
-import Data.List
 import Data.Char
+import Data.List
 
 type Frame = [(String, Expr)]
 type Bindings = [Frame]
@@ -30,7 +30,7 @@ data Stmt = AddVarStmt Expr Expr
 execute :: Stmt -> Bindings -> Bindings
 execute (AddVarStmt (VarExpr name) expr) b = add b name $ value expr b
 execute (ChangeStmt cell expr) b = mutate cell b $ value expr b
-execute (EvalStmt expr) b = value expr b `seq` b --TODO: remove EvalStmt
+execute (EvalStmt expr) b = value expr b `seq` b
 
 instance Show Stmt where
     show (AddVarStmt name expr) = show name ++ " := " ++ show expr
@@ -43,7 +43,7 @@ bexecute :: Block -> Bindings -> Bindings
 bexecute (Block block) b = foldr execute (newFrame b) $ reverse block
 
 instance Show Block where
-    show (Block block) = "{\n" ++ (concat $ map (concat . intersperse "    " . lines . show) block) ++ "}"
+    show (Block block) = "{\n" ++ (concat $ map (intercalate "    " . lines . show) block) ++ "}"
 
 type Definition = Stmt
 
@@ -90,21 +90,23 @@ mutate (VarExpr name) b new = change b name new
 mutate (DerefExpr (Pointer b cell)) _ new = mutate cell b new --TODO: fix mutation
 
 value :: Expr -> Bindings -> Expr
-value (CallExpr expr args) b = let args' = map (\a -> value a b) args
-                               in case value expr b of Function name arg_names block -> get (bexecute block arg_bindings) name
-                                                           where arg_bindings = foldl (\acc (a, n) -> add acc n a) (newFrame [b !! 0]) $ zip args' arg_names
-                                                       Builtin _ f -> f args'
-                                                       _ -> error "not a function"
+value (CallExpr expr args) b =
+    let args' = map (\a -> value a b) args
+    in case value expr b of Function name arg_names block -> get (bexecute block arg_bindings) name
+                                where arg_bindings = foldl (\acc (a, n) -> add acc n a) (newFrame [b !! 0]) $ zip args' arg_names
+                            Builtin _ f -> f args'
+                            _ -> error "not a function"
 value f@(Builtin _ _) _ = f
 value f@(Function _ _ _) _ = f
-value (DerefExpr (Pointer b cell)) _ = value cell b
+value (DerefExpr x) b = case value x b of Pointer b' cell -> value cell b'
+                                          _ -> error "type error"
 value (RefExpr x) b = Pointer b x
 value p@(Pointer _ _) _ = p
 value (VarExpr name) b = get b name
-value x@(IntExpr _) b = x
-value x@(BoolExpr _) b = x
-value x@(TextExpr _) b = x
-value (AddExpr l r) b = case (l', r') of ((IntExpr x), (IntExpr y)) -> IntExpr $ x + y --TODO: refactor like CallExpr
+value x@(IntExpr _) _ = x
+value x@(BoolExpr _) _ = x
+value x@(TextExpr _) _ = x
+value (AddExpr l r) b = case (l', r') of ((IntExpr x), (IntExpr y)) -> IntExpr $ x + y --TODO: refactor somehow
                                          _ -> error "type error"
     where (l', r') = (value l b, value r b)
 value (SubExpr l r) b = case (l', r') of ((IntExpr x), (IntExpr y)) -> IntExpr $ x - y
@@ -209,9 +211,6 @@ charF f = Parser g
               | f x = Just (x, xs)
               | otherwise = Nothing
 
-anyChar :: Parser Char
-anyChar = charF $ \_ -> True
-
 char :: Char -> Parser Char
 char c = charF (==c)
 
@@ -243,8 +242,8 @@ keywords :: [String]
 keywords = ["DEFINE", "FUNCTION", "CALL"]
 
 verifyVar :: Parser Expr -> Parser Expr
-verifyVar p = p >>= (\var@(VarExpr name) -> case elem name keywords of True -> empty
-                                                                       False -> return var)
+verifyVar p = p >>= (\v@(VarExpr name) -> case elem name keywords of True -> empty
+                                                                     False -> return v)
 
 parseVar :: Parser Expr
 parseVar = charF (\x -> isLetter x || x == '_') >>= (\c -> spanP (\x -> isLetter x || isDigit x || x == '_') >>= return . (c:)) >>= verifyVar . return . var
@@ -285,12 +284,12 @@ parseUnary = parseNot <|> parseRef <|> parseDeref
 
 parseAddVar :: Parser Stmt
 parseAddVar = do
-    (VarExpr var) <- parseVar
+    (VarExpr v) <- parseVar
     many ws
     string ":="
     many ws
     expr <- parseExpr
-    return $ addVar var expr
+    return $ addVar v expr
 
 parseChange :: Parser Stmt
 parseChange = do
@@ -361,11 +360,14 @@ foo [(TextExpr x)] = IOExpr $ print x
 foo [(BoolExpr x)] = IOExpr $ print x
 foo _ = error "wrong argument to print function"
 
-builtins :: [Expr]
-builtins = [Builtin "print" foo]
+builtinFunctions :: [Expr]
+builtinFunctions = [Builtin "print" foo]
 
 main = do
     input <- getContents
-    case runParser parseProgram input of Just (prog, _) -> case run prog builtins of IOExpr io -> io
-                                                                                     _ -> undefined
-                                         Nothing -> error "parse error"
+    case runParser parseProgram input of 
+        Just (prog, _)
+            | null prog -> error "parse error"
+            | otherwise -> case run prog builtinFunctions of IOExpr io -> io
+                                                             _ -> undefined
+        Nothing -> error "parse error"
