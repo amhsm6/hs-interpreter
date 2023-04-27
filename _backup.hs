@@ -2,12 +2,11 @@ import Control.Applicative
 import Data.Char
 import Data.List
 
-newtype State a = State { runState :: Bindings -> (Bindings, a) }
+newtype State a = State (Bindings -> (Bindings, a))
 
 instance Monad State where
     return x = State $ \b -> (b, x)
-    (State transform) >>= f = State $ \b -> let (b', x) = transform b
-                                            in runState (f x) b'
+    (State f) >>= g = State $ \b -> f b
 
 instance Applicative State where
     pure = return
@@ -16,84 +15,73 @@ instance Applicative State where
 instance Functor State where
     fmap f a = a >>= return . f
 
---currentBindings :: State Bindings
---currentBindings = State (\s -> (s, s))
+currentBindings :: State Bindings
+currentBindings = State (\s -> (s, s))
 
---getVar "foo" >>= (\x -> currentBindings >>= (\bindings -> pure $ value b x))
-{-
+getVar "foo" >>= (\x -> currentBindings >>= (\bindings -> pure $ value b x))
+
 do
     var <- getVar "foo"
     bindings <- currentBindings
     getFromBindings bindings var
--}
-
---Parser = StateT String Maybe
-{-
-State a x = a -> (a, x)
-IO = State RealWord
--}
-{-
-execute :: Stmt -> State Bindings ()
-
-addVar :: String -> Expr -> State ()
-getVar :: String -> State Expr
--}
 
 type Frame = [(String, Expr)]
 type Bindings = [Frame]
 
+
+
 newFrame :: Bindings -> Bindings
 newFrame b = b ++ [[]]
 
-add :: String -> Expr -> State ()
-add name expr = State $ \b -> let (lastFrame:restFrames) = if length b == 0 then ([]:[]) else reverse b
-                              in case lookup name lastFrame of
-                                     Just _ -> error $ "variable " ++ name ++ " already present"
-                                     Nothing -> (restFrames ++ [lastFrame ++ [(name, expr)]], ())
+{-
+State a x = a -> (a, x)
+IO = State RealWord
+-}
 
-change :: String -> Expr -> State () --TODO: Fix change
-change name expr = State $ \(_:b) -> let new = map processFrame b
-                                         processFrame frame = case lookup name frame of
-                                                                  Just _ -> frame ++ [(name, expr)] --FIXME
-                                                                  Nothing -> frame
-                                     in (new, ()) --FIXME: report an error when variable not found
+execute :: Stmt -> State Bindings ()
 
-get :: String -> State Expr
-get name = State $ \b -> case reverse $ filter ((==) name . fst) $ concat b of
-                             (e:_) -> (b, snd e)
-                             [] -> error $ "variable " ++ name ++ " not found"
+addVar :: String -> Expr -> State ()
+getVar :: String -> State Expr
 
-{-data Stmt = AddVarStmt Expr Expr
+add :: Bindings -> String -> Expr -> Bindings
+add b name expr = case lookup name lastFrame of Just _ -> error $ "variable " ++ name ++ " already present"
+                                                Nothing -> restFrames ++ [lastFrame ++ [(name, expr)]]
+    where (lastFrame:restFrames) = if length b == 0 then ([]:[]) else reverse b
+
+change :: Bindings -> String -> Expr -> Bindings --TODO: Fix change
+change (_:b) name expr = new --if new == b then error $ "variable " ++ name ++ " not found" else new --FIXME
+    where new = map processFrame b
+          processFrame frame = case lookup name frame of Just _ -> frame ++ [(name, expr)] --FIXME
+                                                         Nothing -> frame
+
+get :: Bindings -> String -> Expr
+get b name = case reverse $ filter ((==) name . fst) $ concat b of (e:_) -> snd e
+                                                                   [] -> error $ "variable " ++ name ++ " not found"
+
+data Stmt = AddVarStmt Expr Expr
           | ChangeStmt Expr Expr
           | EvalStmt Expr
--}
-type Stmt = State ()
 
-addVar :: String -> State Expr -> Stmt
-addVar name exprM = exprM >>= \expr -> add name expr
+execute :: Stmt -> Bindings -> Bindings
+execute (AddVarStmt (VarExpr name) expr) b = add b name $ value expr b
+execute (ChangeStmt cell expr) b = mutate cell b $ value expr b
+execute (EvalStmt expr) b = value expr b `seq` b
 
-{-
-changeCell :: Expr -> Expr -> State ()
-changeCell cell expr = 
--}
-
-{-instance Show Stmt where
+instance Show Stmt where
     show (AddVarStmt name expr) = show name ++ " := " ++ show expr
     show (ChangeStmt cell expr) = show cell ++ " = " ++ show expr
     show (EvalStmt expr) = show expr
--}
+
 newtype Block = Block [Stmt]
 
-{-bexecute :: Block -> Bindings -> Bindings
+bexecute :: Block -> Bindings -> Bindings
 bexecute (Block block) b = foldr execute (newFrame b) $ reverse block
 
 instance Show Block where
     show (Block block) = "{\n" ++ (concat $ map (intercalate "    " . lines . show) block) ++ "}"
 
--}
 type Definition = Stmt
 
-{-
 defConst :: String -> Expr -> Definition
 defConst name expr = addVar name expr
 
@@ -106,7 +94,7 @@ run :: Program -> [Expr] -> Expr
 run prog builtins = value (call (get b' "main") []) b'
     where b' = foldr execute b prog
           b = foldl (\acc f@(Builtin name _) -> add acc name f) [] builtins
--}
+
 data Expr = IntExpr Integer
           | BoolExpr Bool
           | TextExpr String
@@ -132,30 +120,12 @@ data Expr = IntExpr Integer
           | CallExpr Expr [Expr]
           | IOExpr (IO ())
 
-int :: Integer -> State Expr
-int = return . IntExpr
-
-bool :: Bool -> State Expr
-bool = return . BoolExpr
-
-text :: String -> State Expr
-text = return . TextExpr
-
-addExpr :: State Expr -> State Expr -> State Expr
-addExpr left right = left >>= \x -> right >>= \y -> case (x, y) of (IntExpr x, IntExpr y) -> int $ x + y
-                                                                   _ -> error "type error"
-
-{-mutate :: Expr -> Bindings -> Expr -> Bindings
+mutate :: Expr -> Bindings -> Expr -> Bindings
 mutate (VarExpr name) b new = change b name new
 mutate (DerefExpr (Pointer b cell)) _ new = mutate cell b new --TODO: fix mutation
--}
--- NEW
-mutate :: Expr -> Expr -> State ()
-mutate (VarExpr name) new = change name new
---mutate (DerefExpr expr) new = case expr of Pointer b expr
 
---value :: Expr -> Bindings -> Expr
-{-value (CallExpr expr args) b =
+value :: Expr -> Bindings -> Expr
+value (CallExpr expr args) b =
     let args' = map (\a -> value a b) args
     in case value expr b of Function name arg_names block -> get (bexecute block arg_bindings) name
                                 where arg_bindings = foldl (\acc (a, n) -> add acc n a) (newFrame [b !! 0]) $ zip args' arg_names
@@ -211,12 +181,11 @@ value (GtExpr l r) b = case (l', r') of ((IntExpr x), (IntExpr y)) -> BoolExpr $
                                         _ -> error "type error"
     where (l', r') = (value l b, value r b)
 value x y = error $ "type error" ++ show x ++ " >>= " ++ show y
--}
 
 instance Show Expr where
     show (CallExpr (VarExpr name) args) = "CALL[" ++ name ++ ", " ++ (concat . intersperse ", " . map show $ args) ++ "]"
     show (Builtin name _) = "<BUILTIN " ++ name ++ ">"
-    --show (Function _ args block) = "FUNCTION[" ++ (concat $ intersperse ", " args) ++ "] " ++ show block
+    show (Function _ args block) = "FUNCTION[" ++ (concat $ intersperse ", " args) ++ "] " ++ show block
     show (DerefExpr x) = "*" ++ show x
     show (RefExpr x) = "&" ++ show x
     show (Pointer _ cell) = "<POINTER TO " ++ show cell ++ ">"
@@ -238,7 +207,7 @@ instance Show Expr where
     show (GeExpr l r) = "(" ++ show l ++ " >= " ++ show r ++ ")"
     show (GtExpr l r) = "(" ++ show l ++ " > " ++ show r ++ ")"
 
-{-int x = IntExpr $ read x
+int x = IntExpr $ read x
 bool x = BoolExpr x
 text x = TextExpr x
 var x = VarExpr x
@@ -246,7 +215,13 @@ ref x = RefExpr x
 deref x = DerefExpr x
 call f args = CallExpr f args
 
+addVar name expr = AddVarStmt (var name) expr
+changeS cell expr = ChangeStmt cell expr
+eval expr = EvalStmt expr
+
 newtype Parser a = Parser { runParser :: String -> Maybe (a, String) }
+
+Parser = StateT String Maybe
 
 instance Monad Parser where
     return x = Parser $ \input -> Just (x, input)
@@ -433,6 +408,3 @@ main = do
             | otherwise -> case run prog builtinFunctions of IOExpr io -> io
                                                              _ -> undefined
         Nothing -> error "parse error"
--}
-main :: IO ()
-main = return ()
