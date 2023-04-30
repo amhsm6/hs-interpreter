@@ -1,48 +1,37 @@
---getVar "printF" >>= (\x -> currentBindings >>= (\bindings -> pure $ value b x))
-{-
-do
-    var <- getVar "printF"
-    bindings <- currentBindings
-    getFromBindings bindings var
--}
-
---Parser = StateT String Maybe
-{-
-State a x = a -> (a, x)
-IO = State RealWord
--}
-{-
-execute :: Stmt -> State Bindings ()
-
-addVar :: String -> Expr -> State ()
-getVar :: String -> State Expr
--}
-
 import Control.Monad
 import Control.Applicative
 import Data.Char
 import qualified Data.Map as M
 import Data.List
 
-newtype State a = State { runState :: Bindings -> (Bindings, a) }
+newtype State a = State { runState :: (Bindings, IO ()) -> ((Bindings, IO ()), a) }
 
 instance Monad State where
     return = pure
-    (State m) >>= g = State $ \b -> let (b', x) = m b
-                                    in runState (g x) b'
+    (State m) >>= g = State $ \s -> let (s', x) = m s
+                                    in runState (g x) s'
 
 instance Applicative State where
-    pure x = State $ \b -> (b, x)
+    pure x = State $ \s -> (s, x)
     f <*> a = f >>= \g -> a >>= pure . g
 
 instance Functor State where
     fmap f a = a >>= pure . f
 
-put :: Bindings -> State ()
-put b = State $ \_ -> (b, ())
+putBindings :: Bindings -> State ()
+putBindings b = State $ \(_, io) -> ((b, io), ())
 
-currentBindings :: State Bindings
-currentBindings = State $ \b -> (b, b)
+getBindings :: State Bindings
+getBindings = State $ \(b, io) -> ((b, io), b)
+
+putIO :: IO () -> State ()
+putIO io = State $ \(b, _) -> ((b, io), ())
+
+getIO :: State (IO ())
+getIO = State $ \(b, io) -> ((b, io), io)
+
+updIO :: IO () -> State ()
+updIO io = getIO >>= \oldio -> putIO $ oldio >> io
 
 type Frame = M.Map String Expr
 type Bindings = [Frame]
@@ -51,22 +40,24 @@ newFrame :: Bindings -> Bindings
 newFrame b = b ++ [M.empty]
 
 add :: String -> Expr -> State ()
-add name expr = State $ \b -> let (lastFrame, restFrames) = if length b == 0 then (M.empty, []) else (head b, tail b)
-                              in case M.lookup name lastFrame of
-                                     Just _ -> error $ "variable " ++ name ++ " already present"
-                                     Nothing -> (M.insert name expr lastFrame : restFrames, ())
+add name expr = getBindings >>= \b ->
+    let (restFrames, lastFrame) = if length b == 0 then ([], M.empty) else (init b, last b)
+    in case M.lookup name lastFrame of
+           Just _ -> error $ "variable " ++ name ++ " already present"
+           Nothing -> putBindings $ restFrames ++ [M.insert name expr lastFrame]
 
 change :: String -> Expr -> State ()
-change name expr = State $ \b -> let new = map processFrame b --FIXME: restrict updating global variables
-                                     processFrame frame = case M.lookup name frame of
-                                                                  Just _ -> M.update (\_ -> Just expr) name frame
-                                                                  Nothing -> frame
-                                 in (new, ()) --TODO: report an error when variable not found
+change name expr = getBindings >>= \(x:b) ->
+    let new = map processFrame b
+        processFrame frame = case M.lookup name frame of
+                                 Just _ -> M.update (\_ -> Just expr) name frame
+                                 Nothing -> frame
+    in putBindings $ x:new --TODO: report an error when variable not found
 
 get :: String -> State Expr
-get name = State $ \b -> case foldr (<|>) Nothing $ map (M.lookup name) b of
-                             Just expr -> (b, expr)
-                             Nothing -> error $ "variable " ++ name ++ " not found"
+get name = getBindings >>= \b -> case foldl (<|>) Nothing $ reverse $ map (M.lookup name) b of
+                                     Just expr -> pure expr
+                                     Nothing -> error $ "variable " ++ name ++ " not found"
 
 data Stmt = AddVarStmt Expr Expr
           | ChangeStmt Expr Expr
@@ -84,7 +75,7 @@ eval = EvalStmt
 execute :: Stmt -> State ()
 execute (AddVarStmt (VarExpr name) expr) = value expr >>= add name
 execute (ChangeStmt cell expr) = value expr >>= mutate cell
-execute (EvalStmt expr) = value expr >>= error . show >> pure ()
+execute (EvalStmt expr) = value expr >> pure ()
 
 instance Show Stmt where
     show (AddVarStmt name expr) = show name ++ " := " ++ show expr
@@ -135,7 +126,6 @@ data Expr = IntExpr Integer
           | Function String [String] Block
           | Builtin String ([Expr] -> State Expr)
           | CallExpr Expr [Expr]
-          | IOExpr (IO ())
 
 int :: Integer -> Expr
 int = IntExpr
@@ -177,21 +167,20 @@ value (CallExpr expr args) = do
     f <- value expr
     case f of
         Function name argNames block -> do
-            b <- currentBindings
-            put $ newFrame [b !! 0]
+            b <- getBindings
+            putBindings $ newFrame [b !! 0]
             zipWithM_ add argNames values
             bexecute block
-            b' <- currentBindings
             ret <- get name
-            put b
-            pure $ ret
-        Builtin _ f -> f values
+            putBindings b
+            pure ret
+        Builtin _ g -> g values
         _ -> error "type error"
 value f@(Builtin _ _) = pure f
 value f@(Function _ _ _) = pure f
 value (DerefExpr x) = value x >>= \p -> case p of Pointer _ cell -> value cell --FIXME
                                                   _ -> error "type error"
-value (RefExpr x) = currentBindings >>= \b -> pure $ ptr b x
+value (RefExpr x) = getBindings >>= \b -> pure $ ptr b x
 value p@(Pointer _ _) = pure p
 value (VarExpr name) = get name
 value (IntExpr x) = pure $ int x
@@ -276,10 +265,9 @@ value (GtExpr l r) = do
         _ -> error "type error"
 
 instance Show Expr where
-    show (IOExpr _) = "IO"
-    show (CallExpr (VarExpr name) args) = "CALL[" ++ name ++ ", " ++ (concat . intersperse ", " . map show $ args) ++ "]"
+    show (CallExpr name args) = "CALL[" ++ show name ++ ", " ++ (intercalate ", " . map show $ args) ++ "]"
     show (Builtin name _) = "<BUILTIN " ++ name ++ ">"
-    show (Function _ args block) = "FUNCTION[" ++ (concat $ intersperse ", " args) ++ "] " ++ show block
+    show (Function _ args block) = "FUNCTION[" ++ (intercalate ", " args) ++ "] " ++ show block
     show (DerefExpr x) = "*" ++ show x
     show (RefExpr x) = "&" ++ show x
     show (Pointer _ cell) = "<POINTER TO " ++ show cell ++ ">"
@@ -434,7 +422,7 @@ parseFunction = do
     block <- sepBy ws parseStmt
     many ws
     char '}'
-    pure $ Function "" (map (\(VarExpr name) -> name) args) (Block block)
+    pure $ func "" (map (\(VarExpr name) -> name) args) (Block block)
 
 parseCall :: Parser Expr
 parseCall = do
@@ -472,16 +460,15 @@ parseProgram :: Parser Program
 parseProgram = sepBy ws parseDefinition
 
 printF :: [Expr] -> State Expr
---printF [IntExpr x] = get "io" >>= \(IOExpr old) -> change "io" (IOExpr $ old >> io) >> pure (int 0)
---    where io = print $ show x
-printF _ = error "wrong argument to print function"
+printF xs = updIO (putStrLn $ intercalate " " $ map show xs) >> pure (int 0)
 
 builtinFunctions :: [Expr]
-builtinFunctions = [Builtin "prit" printF]
+builtinFunctions = [Builtin "print" printF]
 
+main :: IO ()
 main = do
     input <- getContents
     let parsed = runParser parseProgram input
     let prog = maybe (error "parse error") (\(x, _) -> if null x then error "parse error" else x) parsed 
-    let (IOExpr io) = snd $ runState (run prog builtinFunctions >> get "io") [M.fromList [("io", IOExpr $ pure ())]]
+    let ((_, io), _) = runState (run prog builtinFunctions) ([], pure ())
     io
