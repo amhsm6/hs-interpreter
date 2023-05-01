@@ -39,6 +39,9 @@ type Bindings = [Frame]
 newFrame :: Bindings -> Bindings
 newFrame b = b ++ [M.empty]
 
+removeFrame :: Bindings -> Bindings
+removeFrame b = init b
+
 add :: String -> Expr -> State ()
 add name expr = getBindings >>= \b ->
     let (restFrames, lastFrame) = if length b == 0 then ([], M.empty) else (init b, last b)
@@ -59,9 +62,13 @@ get name = getBindings >>= \b -> case foldl (<|>) Nothing $ reverse $ map (M.loo
                                      Just expr -> pure expr
                                      Nothing -> error $ "variable " ++ name ++ " not found"
 
-data Stmt = AddVarStmt Expr Expr
+data Stmt = Block [Stmt]
+          | AddVarStmt Expr Expr
           | ChangeStmt Expr Expr
           | EvalStmt Expr
+          | IfStmt Expr Stmt
+          | IfElseStmt Expr Stmt Stmt
+          | WhileStmt Expr Stmt
 
 addVar :: String -> Expr -> Stmt
 addVar name = AddVarStmt $ var name
@@ -72,36 +79,56 @@ changeS = ChangeStmt
 eval :: Expr -> Stmt
 eval = EvalStmt
 
+ifS :: Expr -> Stmt -> Stmt
+ifS = IfStmt
+
+ifElseS :: Expr -> Stmt -> Stmt -> Stmt
+ifElseS = IfElseStmt
+
+while :: Expr -> Stmt -> Stmt
+while = WhileStmt
+
 execute :: Stmt -> State ()
+execute (Block stmts) = do
+    b <- getBindings
+    putBindings $ newFrame b
+    sequence_ $ map execute stmts
+    b' <- getBindings
+    putBindings $ removeFrame b'
 execute (AddVarStmt (VarExpr name) expr) = value expr >>= add name
 execute (ChangeStmt cell expr) = value expr >>= mutate cell
 execute (EvalStmt expr) = value expr >> pure ()
+execute (IfStmt cond block) = value cond >>= \x ->
+    case x of BoolExpr y -> if y then execute block else pure ()
+              _ -> error "type error"
+execute (IfElseStmt cond blockTrue blockFalse) = value cond >>= \x ->
+    case x of BoolExpr y -> execute $ if y then blockTrue else blockFalse
+              _ -> error "type error"
+execute while@(WhileStmt cond block) = value cond >>= \x ->
+    case x of BoolExpr y -> if y then execute block >> execute while else pure ()
+              _ -> error "type error"
 
 instance Show Stmt where
+    show (Block block) = "{\n" ++ (concat $ map (intercalate "    " . lines . show) block) ++ "}"
     show (AddVarStmt name expr) = show name ++ " := " ++ show expr
     show (ChangeStmt cell expr) = show cell ++ " = " ++ show expr
     show (EvalStmt expr) = show expr
-
-newtype Block = Block [Stmt]
-
-bexecute :: Block -> State ()
-bexecute (Block block) = sequence_ $ map execute block
-
-instance Show Block where
-    show (Block block) = "{\n" ++ (concat $ map (intercalate "    " . lines . show) block) ++ "}"
+    show (IfStmt cond block) = intercalate " " ["IF", show cond, show block]
+    show (IfElseStmt cond blockTrue blockFalse) = intercalate " " ["IF", show cond, show blockTrue, "ELSE", show blockFalse]
+    show (WhileStmt cond block) = intercalate " " ["WHILE", show cond, show block]
 
 type Definition = Stmt
 
-defConst :: String -> Expr -> Definition
-defConst name expr = addVar name expr
+defineConst :: String -> Expr -> Definition
+defineConst name expr = addVar name expr
 
-define :: String -> [String] -> [Stmt] -> Definition
-define name args body = addVar name $ Function name args (Block body)
+defineFunc :: String -> [String] -> Stmt -> Definition
+defineFunc name args body = addVar name $ func name args body
 
 type Program = [Definition]
 
 run :: Program -> [Expr] -> State ()
-run prog builtins = mapM_ (\f@(Builtin name _) -> add name f) builtins >> bexecute (Block prog) >> (execute $ eval $ call (var "main") [])
+run prog builtins = mapM_ (\f@(Builtin name _) -> add name f) builtins >> mapM_ execute prog >> (execute $ eval $ call (var "main") [])
 
 data Expr = IntExpr Integer
           | BoolExpr Bool
@@ -123,7 +150,7 @@ data Expr = IntExpr Integer
           | Pointer Bindings Expr
           | RefExpr Expr
           | DerefExpr Expr
-          | Function String [String] Block
+          | Function String [String] Stmt
           | Builtin String ([Expr] -> State Expr)
           | CallExpr Expr [Expr]
 
@@ -148,7 +175,7 @@ ref = RefExpr
 deref :: Expr -> Expr
 deref = DerefExpr
 
-func :: String -> [String] -> Block -> Expr
+func :: String -> [String] -> Stmt -> Expr
 func = Function
 
 call :: Expr -> [Expr] -> Expr
@@ -170,7 +197,7 @@ value (CallExpr expr args) = do
             b <- getBindings
             putBindings $ newFrame [b !! 0]
             zipWithM_ add argNames values
-            bexecute block
+            execute block
             ret <- get name
             putBindings b
             pure ret
@@ -344,7 +371,7 @@ parseText :: Parser Expr
 parseText = (char '\"' *> spanP (/='\"') <* char '\"') >>= pure . text
 
 keywords :: [String]
-keywords = ["DEFINE", "FUNCTION", "CALL"]
+keywords = ["DEFINE", "FUNCTION", "CALL", "IF", "ELSE", "WHILE"]
 
 verifyVar :: Parser Expr -> Parser Expr
 verifyVar p = p >>= \v@(VarExpr name) -> case elem name keywords of True -> empty
@@ -369,14 +396,14 @@ ops = [ ("+", AddExpr)
       ]
 
 parseBinOp :: Parser (Expr -> Expr -> Expr)
-parseBinOp = (foldl (<|>) empty $ map (string . fst) ops) >>= (\x -> case lookup x ops of Just e -> pure e
-                                                                                          Nothing -> undefined)
+parseBinOp = (foldl (<|>) empty $ map (string . fst) ops) >>= \x -> case lookup x ops of Just e -> pure e
+                                                                                         Nothing -> undefined
 
 parseBinary :: Parser Expr
-parseBinary = char '(' *> (parseExpr >>= (\x -> some ws >> parseBinOp >>= (\o -> some ws >> parseExpr >>= (\y -> pure $ o x y)))) <* char ')'
+parseBinary = char '(' *> (parseExpr >>= \x -> some ws >> parseBinOp >>= \o -> some ws >> parseExpr >>= \y -> pure $ o x y) <* char ')'
 
 parseNot :: Parser Expr
-parseNot = char '(' *> (string "NOT" >> some ws >> parseExpr >>= (\e -> pure $ NotExpr e)) <* char ')'
+parseNot = char '(' *> (string "NOT" >> some ws >> parseExpr >>= \e -> pure $ NotExpr e) <* char ')'
 
 parseRef :: Parser Expr
 parseRef = char '&' >> parseVar >>= pure . ref
@@ -408,8 +435,55 @@ parseChange = do
 parseEval :: Parser Stmt
 parseEval = parseExpr >>= pure . eval
 
+parseIf :: Parser Stmt
+parseIf = do
+    string "IF"
+    some ws
+    cond <- parseExpr
+    many ws
+    char '{'
+    many ws
+    block <- sepBy ws parseStmt
+    many ws
+    char '}'
+    pure $ ifS cond (Block block)
+
+parseIfElse :: Parser Stmt
+parseIfElse = do
+    string "IF"
+    some ws
+    cond <- parseExpr
+    many ws
+    char '{'
+    many ws
+    blockTrue <- sepBy ws parseStmt
+    many ws
+    char '}'
+    many ws
+    string "ELSE"
+    some ws
+    char '{'
+    many ws
+    blockFalse <- sepBy ws parseStmt
+    many ws
+    char '}'
+    pure $ ifElseS cond (Block blockTrue) (Block blockFalse)
+
+parseWhile :: Parser Stmt
+parseWhile = do
+    string "WHILE"
+    some ws
+    cond <- parseExpr
+    many ws
+    char '{'
+    many ws
+    block <- sepBy ws parseStmt
+    many ws
+    char '}'
+    pure $ while cond (Block block)
+
 parseStmt :: Parser Stmt
-parseStmt = parseAddVar <|> parseChange <|> parseEval
+parseStmt = parseAddVar <|> parseChange <|> parseEval <|> parseIfElse <|> parseIf <|> parseWhile
 
 parseFunction :: Parser Expr
 parseFunction = do
@@ -453,8 +527,8 @@ parseDefinition = do
     string ":="
     many ws
     expr <- parseExpr
-    case expr of Function _ args (Block body) -> pure $ define name args body
-                 _ -> pure $ defConst name expr
+    case expr of Function _ args body -> pure $ defineFunc name args body
+                 _ -> pure $ defineConst name expr
 
 parseProgram :: Parser Program
 parseProgram = sepBy ws parseDefinition
