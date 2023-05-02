@@ -1,0 +1,37 @@
+DEFINE swap := FUNCTION[a, b] {
+    tmp := *a
+    *a = *b
+    *b = tmp
+}
+
+DEFINE bubble_step := FUNCTION[numbers] {
+    i := 1
+    
+    WHILE (i < LENGTH[*numbers]) {
+        a := &INDEX[*numbers, (i - 1)]
+        b := &INDEX[*numbers, i]
+
+        IF (*a > *b) {
+            CALL[swap, a, b]
+        }
+        
+        i = (i + 1)
+    }
+}
+
+DEFINE bubble_sort := FUNCTION[numbers] {
+    i := 1
+
+    WHILE (i < LENGTH[*numbers]) {
+        CALL[bubble_step, numbers]
+
+        i = (i + 1)
+    }
+}
+
+DEFINE main := FUNCTION[] {
+    numbers := ARRAY[5, 3, 2, 1, 8, 10, 12, 123, 123, 23, 1, 123, 3, 8, 5, 10, 89, 32, 54, 146, 64]
+
+    CALL[bubble_sort, &numbers]
+    CALL[print, numbers]
+}

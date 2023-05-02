@@ -139,6 +139,9 @@ data Expr = IntExpr Integer
           | Function String [String] Stmt
           | Builtin String ([Expr] -> ProgramState Expr)
           | CallExpr Expr [Expr]
+          | ArrayExpr [Expr]
+          | IndexExpr Expr Expr
+          | LengthExpr Expr
 
 int :: Integer -> Expr
 int = IntExpr
@@ -167,6 +170,15 @@ func = Function
 call :: Expr -> [Expr] -> Expr
 call = CallExpr
 
+arr :: [Expr] -> Expr
+arr = ArrayExpr
+
+index :: Expr -> Expr -> Expr
+index = IndexExpr
+
+lengthE :: Expr -> Expr
+lengthE = LengthExpr
+
 mutate :: Expr -> Expr -> ProgramState ()
 mutate (VarExpr name) new = change name new
 mutate (DerefExpr expr) new = value expr >>= \p ->
@@ -177,8 +189,43 @@ mutate (DerefExpr expr) new = value expr >>= \p ->
             mutate cell new
             put b'
         _ -> error "type error"
+mutate (IndexExpr i array) new = do
+    i' <- value i
+    let idx = case i' of
+                    IntExpr x -> fromIntegral x
+                    _ -> error "type error"
+
+    array' <- value array
+    let elems = case array' of
+                    ArrayExpr elems -> elems
+                    _ -> error "type error"
+
+    if idx < 0 || idx >= length elems then error "index error" else pure ()
+
+    let elems' = zipWith (\idx' e -> if idx == idx' then new else e) [0..] elems
+    mutate array $ arr elems'
 
 value :: Expr -> ProgramState Expr
+value (LengthExpr array) = do
+    array' <- value array
+    case array' of
+        ArrayExpr elems -> pure $ int $ fromIntegral $ length elems
+        _ -> error "type error"
+value (IndexExpr i array) = do
+    i' <- value i
+    let idx = case i' of
+                    IntExpr x -> fromIntegral x
+                    _ -> error "type error"
+
+    array' <- value array
+    let elems = case array' of
+                    ArrayExpr elems -> elems
+                    _ -> error "type error"
+
+    if idx < 0 || idx >= length elems then error "index error" else pure ()
+
+    pure $ elems !! idx
+value a@(ArrayExpr _) = pure a
 value (CallExpr expr args) = do
     values <- mapM value args
     f <- value expr
@@ -290,7 +337,10 @@ value (GtExpr l r) = do
         _ -> error "type error"
 
 instance Show Expr where
-    show (CallExpr name args) = "CALL[" ++ show name ++ ", " ++ (intercalate ", " . map show $ args) ++ "]"
+    show (LengthExpr array) = "LENGTH[" ++ show array ++ "]"
+    show (IndexExpr index array) = "INDEX[" ++ show array ++ ", " ++ show index
+    show (ArrayExpr elems) = "ARRAY[" ++ (intercalate ", " $ map show elems) ++ "]"
+    show (CallExpr name args) = "CALL[" ++ show name ++ ", " ++ (intercalate ", " $ map show args) ++ "]"
     show (Builtin name _) = "<BUILTIN " ++ name ++ ">"
     show (Function _ args block) = "FUNCTION[" ++ (intercalate ", " args) ++ "] " ++ show block
     show (DerefExpr x) = "*" ++ show x
@@ -369,7 +419,7 @@ parseText :: Parser Expr
 parseText = (char '\"' *> spanP (/='\"') <* char '\"') >>= pure . text
 
 keywords :: [String]
-keywords = ["DEFINE", "FUNCTION", "CALL", "IF", "ELSE", "WHILE"]
+keywords = ["DEFINE", "FUNCTION", "CALL", "IF", "ELSE", "WHILE", "ARRAY", "INDEX", "LENGTH"]
 
 verifyVar :: Parser Expr -> Parser Expr
 verifyVar p = p >>= \v@(VarExpr name) -> case elem name keywords of True -> empty
@@ -404,7 +454,7 @@ parseNot :: Parser Expr
 parseNot = char '(' *> (string "NOT" >> some ws >> parseExpr >>= \e -> pure $ NotExpr e) <* char ')'
 
 parseRef :: Parser Expr
-parseRef = char '&' >> parseVar >>= pure . ref
+parseRef = char '&' >> parseExpr >>= pure . ref
 
 parseDeref :: Parser Expr
 parseDeref = char '*' >> parseVar >>= pure . deref
@@ -423,7 +473,7 @@ parseAddVar = do
 
 parseChange :: Parser Stmt
 parseChange = do
-    cell <- parseVar <|> parseDeref
+    cell <- parseVar <|> parseDeref <|> parseIndex
     many ws
     char '='
     many ws
@@ -506,6 +556,30 @@ parseCall = do
     char ']'
     pure $ call f args
 
+parseArray :: Parser Expr
+parseArray = do
+    string "ARRAY["
+    elems <- sepBy (char ',') parseExpr
+    char ']'
+    pure $ arr elems
+
+parseIndex :: Parser Expr
+parseIndex = do
+    string "INDEX["
+    array <- parseExpr
+    char ','
+    many ws
+    idx <- parseExpr
+    char ']'
+    pure $ index idx array
+
+parseLength :: Parser Expr
+parseLength = do
+    string "LENGTH["
+    array <- parseExpr
+    char ']'
+    pure $ lengthE array
+
 parseExpr :: Parser Expr
 parseExpr = parseInt <|> 
             parseBool <|>
@@ -514,7 +588,10 @@ parseExpr = parseInt <|>
             parseUnary <|>
             parseVar <|>
             parseFunction <|>
-            parseCall
+            parseCall <|>
+            parseArray <|>
+            parseIndex <|>
+            parseLength
 
 parseDefinition :: Parser Definition
 parseDefinition = do
