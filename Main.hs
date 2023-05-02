@@ -111,7 +111,10 @@ defineFunc name args body = addVar name $ func name args body
 type Program = [Definition]
 
 run :: Program -> [Expr] -> ProgramState ()
-run prog builtins = mapM_ (\f@(Builtin name _) -> add name f) builtins >> mapM_ execute prog >> (execute $ eval $ call (var "main") [])
+run prog builtins = do
+    mapM_ (\f@(Builtin name _) -> add name f) builtins
+    mapM_ execute prog
+    execute $ eval $ call (var "main") []
 
 data Expr = IntExpr Integer
           | BoolExpr Bool
