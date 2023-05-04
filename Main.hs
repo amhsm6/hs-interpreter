@@ -12,7 +12,7 @@ type Frame = IORef (M.Map String Expr)
 type Bindings = [Frame]
 
 newFrame :: ProgramState ()
-newFrame = get >>= \b -> (liftIO $ newIORef M.empty) >>= \f -> put $ b ++ [f]
+newFrame = get >>= \b -> liftIO (newIORef M.empty) >>= \f -> put $ b ++ [f]
 
 removeFrame :: ProgramState ()
 removeFrame = get >>= put . init
@@ -448,7 +448,7 @@ parseBinOp = (foldl (<|>) empty $ map (string . fst) ops) >>= \x -> case lookup 
                                                                                          Nothing -> undefined
 
 parseBinary :: Parser Expr
-parseBinary = char '(' *> (parseExpr >>= \x -> some ws >> parseBinOp >>= \o -> some ws >> parseExpr >>= \y -> pure $ o x y) <* char ')'
+parseBinary = char '(' *> (parseExpr >>= \x -> many ws >> parseBinOp >>= \o -> many ws >> parseExpr >>= \y -> pure $ o x y) <* char ')'
 
 parseNot :: Parser Expr
 parseNot = char '(' *> (string "NOT" >> some ws >> parseExpr >>= \e -> pure $ NotExpr e) <* char ')'
