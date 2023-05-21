@@ -6,18 +6,18 @@ import Data.Char
 import qualified Data.Map as M
 import Data.List
 
-type ProgramState = StateT Bindings IO 
+type Action = StateT Bindings IO 
 
 type Frame = IORef (M.Map String Expr)
 type Bindings = [Frame]
 
-newFrame :: ProgramState ()
+newFrame :: Action ()
 newFrame = get >>= \b -> liftIO (newIORef M.empty) >>= \f -> put $ b ++ [f]
 
-removeFrame :: ProgramState ()
+removeFrame :: Action ()
 removeFrame = get >>= put . init
 
-add :: String -> Expr -> ProgramState ()
+add :: String -> Expr -> Action ()
 add name expr = do
     b <- get
     if length b == 0 then newFrame else pure ()
@@ -29,16 +29,16 @@ add name expr = do
             Just  _ -> error $ "variable " ++ name ++ " already present"
             Nothing -> modifyIORef lastFrameRef $ M.insert name expr
 
-change :: String -> Expr -> ProgramState ()
+change :: String -> Expr -> Action ()
 change name expr = do
     b <- get
     let lookups = forM b $ \r -> readIORef r >>= pure . (const (Just r) <=< M.lookup name)
     liftIO $ lookups >>= \refs ->
         case foldl (<|>) Nothing $ reverse refs of
-            Just r -> modifyIORef r $ M.update (const $ Just expr) name
+            Just r -> modifyIORef r $ M.adjust (const expr) name
             Nothing -> error $ "variable " ++ name ++ " not found"
 
-fetch :: String -> ProgramState Expr
+fetch :: String -> Action Expr
 fetch name = do
     b <- get
     let lookups = forM b $ \r -> readIORef r >>= pure . M.lookup name
@@ -73,7 +73,7 @@ ifElseS = IfElseStmt
 while :: Expr -> Stmt -> Stmt
 while = WhileStmt
 
-execute :: Stmt -> ProgramState ()
+execute :: Stmt -> Action ()
 execute (Block stmts) = do
     newFrame
     mapM_ execute stmts
@@ -110,7 +110,7 @@ defineFunc name args body = addVar name $ func name args body
 
 type Program = [Definition]
 
-run :: Program -> [Expr] -> ProgramState ()
+run :: Program -> [Expr] -> Action ()
 run prog builtins = do
     mapM_ (\f@(Builtin name _) -> add name f) builtins
     mapM_ execute prog
@@ -137,7 +137,7 @@ data Expr = IntExpr Integer
           | RefExpr Expr
           | DerefExpr Expr
           | Function String [String] Stmt
-          | Builtin String ([Expr] -> ProgramState Expr)
+          | Builtin String ([Expr] -> Action Expr)
           | CallExpr Expr [Expr]
           | ArrayExpr [Expr]
           | IndexExpr Expr Expr
@@ -179,7 +179,7 @@ index = IndexExpr
 lengthE :: Expr -> Expr
 lengthE = LengthExpr
 
-mutate :: Expr -> Expr -> ProgramState ()
+mutate :: Expr -> Expr -> Action ()
 mutate (VarExpr name) new = change name new
 mutate (DerefExpr expr) new = value expr >>= \p ->
     case p of
@@ -205,7 +205,7 @@ mutate (IndexExpr i array) new = do
     let elems' = zipWith (\idx' e -> if idx == idx' then new else e) [0..] elems
     mutate array $ arr elems'
 
-value :: Expr -> ProgramState Expr
+value :: Expr -> Action Expr
 value (LengthExpr array) = do
     array' <- value array
     case array' of
@@ -608,7 +608,7 @@ parseDefinition = do
 parseProgram :: Parser Program
 parseProgram = sepBy ws parseDefinition
 
-printF :: [Expr] -> ProgramState Expr
+printF :: [Expr] -> Action Expr
 printF xs = liftIO (putStrLn $ intercalate " " $ map show xs) >> pure (int 0)
 
 builtinFunctions :: [Expr]
