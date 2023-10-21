@@ -2,14 +2,14 @@ import Control.Monad
 import Control.Monad.State
 import Control.Applicative
 import Data.IORef
-import Data.Char
 import qualified Data.Map as M
 import Data.List
-
-type Action = StateT Bindings IO 
+import Data.Char
 
 type Frame = IORef (M.Map String Expr)
 type Bindings = [Frame]
+
+type Action = StateT Bindings IO 
 
 newFrame :: Action ()
 newFrame = get >>= \b -> liftIO (newIORef M.empty) >>= \f -> put $ b ++ [f]
@@ -19,31 +19,29 @@ removeFrame = get >>= put . init
 
 add :: String -> Expr -> Action ()
 add name expr = do
-    b <- get
-    if length b == 0 then newFrame else pure ()
+    b <- get >>= \b -> when (null b) newFrame >> get
 
-    b' <- get
-    let lastFrameRef = last b'
-    liftIO $ readIORef lastFrameRef >>= \lastFrame ->
-        case M.lookup name lastFrame of
-            Just  _ -> error $ "variable " ++ name ++ " already present"
-            Nothing -> modifyIORef lastFrameRef $ M.insert name expr
+    let lastFrameRef = last b
+    lastFrame <- liftIO $ readIORef lastFrameRef
+    case M.lookup name lastFrame of
+        Just  _ -> error $ "variable " ++ name ++ " already present"
+        Nothing -> liftIO $ modifyIORef lastFrameRef $ M.insert name expr
 
 change :: String -> Expr -> Action ()
 change name expr = do
     b <- get
-    let lookups = forM b $ \r -> readIORef r >>= pure . (const (Just r) <=< M.lookup name)
-    liftIO $ lookups >>= \refs ->
-        case foldl (<|>) Nothing $ reverse refs of
+    liftIO $ do
+        refs <- forM b $ \r -> readIORef r >>= pure . (M.lookup name >=> const (Just r))
+        case foldl (<|>) Nothing refs of
             Just r -> modifyIORef r $ M.adjust (const expr) name
             Nothing -> error $ "variable " ++ name ++ " not found"
 
 fetch :: String -> Action Expr
 fetch name = do
     b <- get
-    let lookups = forM b $ \r -> readIORef r >>= pure . M.lookup name
-    liftIO $ lookups >>= \exprs ->
-        case foldl (<|>) Nothing $ reverse exprs of
+    liftIO $ do
+        exprs <- forM b $ \r -> readIORef r >>= pure . M.lookup name
+        case foldl (<|>) Nothing exprs of
             Just expr -> pure expr
             Nothing -> error $ "variable " ++ name ++ " not found"
 
@@ -56,22 +54,7 @@ data Stmt = Block [Stmt]
           | WhileStmt Expr Stmt
 
 addVar :: String -> Expr -> Stmt
-addVar name = AddVarStmt $ var name
-
-changeS :: Expr -> Expr -> Stmt
-changeS = ChangeStmt
-
-eval :: Expr -> Stmt
-eval = EvalStmt
-
-ifS :: Expr -> Stmt -> Stmt
-ifS = IfStmt
-
-ifElseS :: Expr -> Stmt -> Stmt -> Stmt
-ifElseS = IfElseStmt
-
-while :: Expr -> Stmt -> Stmt
-while = WhileStmt
+addVar = AddVarStmt . VarExpr
 
 execute :: Stmt -> Action ()
 execute (Block stmts) = do
@@ -80,16 +63,22 @@ execute (Block stmts) = do
     removeFrame
 execute (AddVarStmt (VarExpr name) expr) = value expr >>= add name
 execute (ChangeStmt cell expr) = value expr >>= mutate cell
-execute (EvalStmt expr) = value expr >> pure ()
-execute (IfStmt cond block) = value cond >>= \x ->
-    case x of BoolExpr y -> if y then execute block else pure ()
-              _ -> error "type error"
-execute (IfElseStmt cond blockTrue blockFalse) = value cond >>= \x ->
-    case x of BoolExpr y -> execute $ if y then blockTrue else blockFalse
-              _ -> error "type error"
-execute while@(WhileStmt cond block) = value cond >>= \x ->
-    case x of BoolExpr y -> if y then execute block >> execute while else pure ()
-              _ -> error "type error"
+execute (EvalStmt expr) = void $ value expr
+execute (IfStmt cond block) = do
+    x <- value cond
+    case x of
+        BoolExpr y -> when y $ execute block
+        _ -> error "type error"
+execute (IfElseStmt cond blockTrue blockFalse) = do
+    x <- value cond
+    case x of
+        BoolExpr y -> execute $ if y then blockTrue else blockFalse
+        _ -> error "type error"
+execute while@(WhileStmt cond block) = do
+    x <- value cond
+    case x of
+        BoolExpr y -> when y $ execute block >> execute while
+        _ -> error "type error"
 
 instance Show Stmt where
     show (Block block) = "{\n" ++ (concat $ map (intercalate "    " . lines . show) block) ++ "}"
@@ -106,7 +95,7 @@ defineConst :: String -> Expr -> Definition
 defineConst name expr = addVar name expr
 
 defineFunc :: String -> [String] -> Stmt -> Definition
-defineFunc name args body = addVar name $ func name args body
+defineFunc name args body = addVar name $ Function name args body
 
 type Program = [Definition]
 
@@ -114,7 +103,7 @@ run :: Program -> [Expr] -> Action ()
 run prog builtins = do
     mapM_ (\f@(Builtin name _) -> add name f) builtins
     mapM_ execute prog
-    execute $ eval $ call (var "main") []
+    execute $ EvalStmt $ CallExpr (VarExpr "main") []
 
 data Expr = IntExpr Integer
           | BoolExpr Bool
@@ -143,42 +132,6 @@ data Expr = IntExpr Integer
           | IndexExpr Expr Expr
           | LengthExpr Expr
 
-int :: Integer -> Expr
-int = IntExpr
-
-bool :: Bool -> Expr
-bool = BoolExpr
-
-text :: String -> Expr
-text = TextExpr
-
-var :: String -> Expr
-var = VarExpr
-
-ptr :: Bindings -> Expr -> Expr
-ptr = Pointer
-
-ref :: Expr -> Expr
-ref = RefExpr
-
-deref :: Expr -> Expr
-deref = DerefExpr
-
-func :: String -> [String] -> Stmt -> Expr
-func = Function
-
-call :: Expr -> [Expr] -> Expr
-call = CallExpr
-
-arr :: [Expr] -> Expr
-arr = ArrayExpr
-
-index :: Expr -> Expr -> Expr
-index = IndexExpr
-
-lengthE :: Expr -> Expr
-lengthE = LengthExpr
-
 mutate :: Expr -> Expr -> Action ()
 mutate (VarExpr name) new = change name new
 mutate (DerefExpr expr) new = value expr >>= \p ->
@@ -203,13 +156,13 @@ mutate (IndexExpr i array) new = do
     if idx < 0 || idx >= length elems then error "index error" else pure ()
 
     let elems' = zipWith (\idx' e -> if idx == idx' then new else e) [0..] elems
-    mutate array $ arr elems'
+    mutate array $ ArrayExpr elems'
 
 value :: Expr -> Action Expr
 value (LengthExpr array) = do
     array' <- value array
     case array' of
-        ArrayExpr elems -> pure $ int $ fromIntegral $ length elems
+        ArrayExpr elems -> pure $ IntExpr $ fromIntegral $ length elems
         _ -> error "type error"
 value (IndexExpr i array) = do
     i' <- value i
@@ -228,14 +181,17 @@ value (IndexExpr i array) = do
 value a@(ArrayExpr _) = pure a
 value (CallExpr expr args) = do
     values <- mapM value args
+
     f <- value expr
     case f of
         Function name argNames block -> do
             b <- get
-            put [b !! 0]
+            put [head b]
             newFrame
             zipWithM_ add argNames values
+
             execute block
+
             ret <- fetch name
             put b
             pure ret
@@ -252,88 +208,88 @@ value (DerefExpr x) = value x >>= \p ->
             put b'
             pure v
         _ -> error "type error"
-value (RefExpr x) = get >>= \b -> pure $ ptr b x
+value (RefExpr x) = get >>= \b -> pure $ Pointer b x
 value p@(Pointer _ _) = pure p
 value (VarExpr name) = fetch name
-value (IntExpr x) = pure $ int x
-value (BoolExpr x) = pure $ bool x
-value (TextExpr x) = pure $ text x
+value (IntExpr x) = pure $ IntExpr x
+value (BoolExpr x) = pure $ BoolExpr x
+value (TextExpr x) = pure $ TextExpr x
 value (AddExpr l r) = do
     l' <- value l
     r' <- value r
     case (l', r') of
-        (IntExpr x, IntExpr y) -> pure $ int $ x + y
+        (IntExpr x, IntExpr y) -> pure $ IntExpr $ x + y
         _ -> error "type error"
 value (SubExpr l r) = do
     l' <- value l
     r' <- value r
     case (l', r') of
-        (IntExpr x, IntExpr y) -> pure $ int $ x - y
+        (IntExpr x, IntExpr y) -> pure $ IntExpr $ x - y
         _ -> error "type error"
 value (MulExpr l r) = do
     l' <- value l
     r' <- value r
     case (l', r') of
-        (IntExpr x, IntExpr y) -> pure $ int $ x * y
+        (IntExpr x, IntExpr y) -> pure $ IntExpr $ x * y
         _ -> error "type error"
 value (DivExpr l r) = do
     l' <- value l
     r' <- value r
     case (l', r') of
-        (IntExpr x, IntExpr y) -> pure $ int $ if y == 0 then 0 else x `div` y
+        (IntExpr x, IntExpr y) -> pure $ IntExpr $ if y == 0 then 0 else x `div` y
         _ -> error "type error"
 value (ModExpr l r) = do
     l' <- value l
     r' <- value r
     case (l', r') of
-        (IntExpr x, IntExpr y) -> pure $ int $ if y == 0 then 1 else x `mod` y
+        (IntExpr x, IntExpr y) -> pure $ IntExpr $ if y == 0 then 1 else x `mod` y
         _ -> error "type error"
 value (AndExpr l r) = do
     l' <- value l
     r' <- value r
     case (l', r') of
-        (BoolExpr x, BoolExpr y) -> pure $ bool $ x && y
+        (BoolExpr x, BoolExpr y) -> pure $ BoolExpr $ x && y
         _ -> error "type error"
 value (OrExpr l r) = do
     l' <- value l
     r' <- value r
     case (l', r') of
-        (BoolExpr x, BoolExpr y) -> pure $ bool $ x || y
+        (BoolExpr x, BoolExpr y) -> pure $ BoolExpr $ x || y
         _ -> error "type error"
 value (NotExpr a) = do
     a' <- value a
     case a' of
-        BoolExpr x -> pure $ bool $ not x
+        BoolExpr x -> pure $ BoolExpr $ not x
         _ -> error "type error"
 value (LtExpr l r) = do
     l' <- value l
     r' <- value r
     case (l', r') of
-        (IntExpr x, IntExpr y) -> pure $ bool $ x < y
+        (IntExpr x, IntExpr y) -> pure $ BoolExpr $ x < y
         _ -> error "type error"
 value (LeExpr l r) = do
     l' <- value l
     r' <- value r
     case (l', r') of
-        (IntExpr x, IntExpr y) -> pure $ bool $ x <= y
+        (IntExpr x, IntExpr y) -> pure $ BoolExpr $ x <= y
         _ -> error "type error"
 value (EqExpr l r) = do
     l' <- value l
     r' <- value r
     case (l', r') of
-        (IntExpr x, IntExpr y) -> pure $ bool $ x == y
+        (IntExpr x, IntExpr y) -> pure $ BoolExpr $ x == y
         _ -> error "type error"
 value (GeExpr l r) = do
     l' <- value l
     r' <- value r
     case (l', r') of
-        (IntExpr x, IntExpr y) -> pure $ bool $ x >= y
+        (IntExpr x, IntExpr y) -> pure $ BoolExpr $ x >= y
         _ -> error "type error"
 value (GtExpr l r) = do
     l' <- value l
     r' <- value r
     case (l', r') of
-        (IntExpr x, IntExpr y) -> pure $ bool $ x > y
+        (IntExpr x, IntExpr y) -> pure $ BoolExpr $ x > y
         _ -> error "type error"
 
 instance Show Expr where
@@ -368,14 +324,14 @@ newtype Parser a = Parser { runParser :: String -> Maybe (a, String) }
 
 instance Monad Parser where
     return = pure
-    (Parser p) >>= f = Parser $ \input -> p input >>= \(x,input') -> runParser (f x) input'
+    (Parser f) >>= g = Parser $ \input -> f input >>= \(x, input') -> runParser (g x) input'
 
 instance Applicative Parser where
     pure x = Parser $ \input -> Just (x, input)
-    f <*> a = f >>= \g -> a >>= pure . g
+    m1 <*> m2 = m1 >>= \f -> m2 >>= pure . f
 
 instance Functor Parser where
-    fmap f a = a >>= pure . f
+    fmap f m = m >>= pure . f
 
 instance Alternative Parser where
     empty = Parser $ \_ -> Nothing
@@ -384,24 +340,24 @@ instance Alternative Parser where
 instance MonadFail Parser where
     fail _ = Parser $ \_ -> Nothing
 
-charF :: (Char -> Bool) -> Parser Char
-charF f = Parser g
-    where g "" = Nothing
-          g (x:xs)
-              | f x = Just (x, xs)
+charP :: (Char -> Bool) -> Parser Char
+charP pred = Parser f
+    where f "" = Nothing
+          f (x:xs)
+              | pred x = Just (x, xs)
               | otherwise = Nothing
 
 char :: Char -> Parser Char
-char c = charF (==c)
+char = charP . (==)
 
 ws :: Parser Char
-ws = charF isSpace
+ws = charP isSpace
 
 digit :: Parser Char
-digit = charF isDigit
+digit = charP isDigit
 
 string :: String -> Parser String
-string s = sequence $ map char s
+string = mapM char
 
 spanP :: (Char -> Bool) -> Parser String
 spanP f = Parser $ \input -> Just $ span f input
@@ -410,13 +366,13 @@ sepBy :: Parser a -> Parser b -> Parser [b]
 sepBy sep p = (p >>= \x -> (many $ sep >> many ws >> p) >>= pure . (x:)) <|> pure []
 
 parseInt :: Parser Expr
-parseInt = some digit >>= pure . int . read
+parseInt = some digit >>= pure . IntExpr . read
 
 parseBool :: Parser Expr
-parseBool = (string "FALSE" >> (pure $ bool False)) <|> (string "TRUE" >> (pure $ bool True))
+parseBool = (string "FALSE" >> (pure $ BoolExpr False)) <|> (string "TRUE" >> (pure $ BoolExpr True))
 
 parseText :: Parser Expr
-parseText = (char '\"' *> spanP (/='\"') <* char '\"') >>= pure . text
+parseText = (char '\"' *> spanP (/='\"') <* char '\"') >>= pure . TextExpr
 
 keywords :: [String]
 keywords = ["DEFINE", "FUNCTION", "CALL", "IF", "ELSE", "WHILE", "ARRAY", "INDEX", "LENGTH"]
@@ -426,7 +382,7 @@ verifyVar p = p >>= \v@(VarExpr name) -> case elem name keywords of True -> empt
                                                                     False -> pure v
 
 parseVar :: Parser Expr
-parseVar = charF (\x -> isLetter x || x == '_') >>= \c -> spanP (\x -> isLetter x || isDigit x || x == '_') >>= pure . (c:) >>= verifyVar . pure . var
+parseVar = charP (\x -> isLetter x || x == '_') >>= \c -> spanP (\x -> isLetter x || isDigit x || x == '_') >>= pure . (c:) >>= verifyVar . pure . VarExpr
 
 ops :: [(String, Expr -> Expr -> Expr)]
 ops = [ ("+", AddExpr)
@@ -444,20 +400,27 @@ ops = [ ("+", AddExpr)
       ]
 
 parseBinOp :: Parser (Expr -> Expr -> Expr)
-parseBinOp = (foldl (<|>) empty $ map (string . fst) ops) >>= \x -> case lookup x ops of Just e -> pure e
-                                                                                         Nothing -> undefined
+parseBinOp = foldl (<|>) empty (map (string . fst) ops) >>= \x -> maybe undefined pure $ lookup x ops
 
 parseBinary :: Parser Expr
-parseBinary = char '(' *> (parseExpr >>= \x -> many ws >> parseBinOp >>= \o -> many ws >> parseExpr >>= \y -> pure $ o x y) <* char ')'
+parseBinary = do
+    char '('
+    x <- parseExpr
+    many ws
+    o <- parseBinOp
+    many ws
+    y <- parseExpr
+    char ')'
+    pure $ o x y
 
 parseNot :: Parser Expr
 parseNot = char '(' *> (string "NOT" >> some ws >> parseExpr >>= \e -> pure $ NotExpr e) <* char ')'
 
 parseRef :: Parser Expr
-parseRef = char '&' >> parseExpr >>= pure . ref
+parseRef = char '&' >> parseExpr >>= pure . RefExpr
 
 parseDeref :: Parser Expr
-parseDeref = char '*' >> parseVar >>= pure . deref
+parseDeref = char '*' >> parseVar >>= pure . DerefExpr
 
 parseUnary :: Parser Expr
 parseUnary = parseNot <|> parseRef <|> parseDeref
@@ -478,10 +441,10 @@ parseChange = do
     char '='
     many ws
     expr <- parseExpr
-    pure $ changeS cell expr
+    pure $ ChangeStmt cell expr
 
 parseEval :: Parser Stmt
-parseEval = parseExpr >>= pure . eval
+parseEval = EvalStmt <$> parseExpr
 
 parseIf :: Parser Stmt
 parseIf = do
@@ -494,7 +457,7 @@ parseIf = do
     block <- sepBy ws parseStmt
     many ws
     char '}'
-    pure $ ifS cond (Block block)
+    pure $ IfStmt cond (Block block)
 
 parseIfElse :: Parser Stmt
 parseIfElse = do
@@ -515,7 +478,7 @@ parseIfElse = do
     blockFalse <- sepBy ws parseStmt
     many ws
     char '}'
-    pure $ ifElseS cond (Block blockTrue) (Block blockFalse)
+    pure $ IfElseStmt cond (Block blockTrue) (Block blockFalse)
 
 parseWhile :: Parser Stmt
 parseWhile = do
@@ -528,7 +491,7 @@ parseWhile = do
     block <- sepBy ws parseStmt
     many ws
     char '}'
-    pure $ while cond (Block block)
+    pure $ WhileStmt cond (Block block)
 
 parseStmt :: Parser Stmt
 parseStmt = parseAddVar <|> parseChange <|> parseEval <|> parseIfElse <|> parseIf <|> parseWhile
@@ -544,7 +507,7 @@ parseFunction = do
     block <- sepBy ws parseStmt
     many ws
     char '}'
-    pure $ func "" (map (\(VarExpr name) -> name) args) (Block block)
+    pure $ Function "" (map (\(VarExpr name) -> name) args) (Block block)
 
 parseCall :: Parser Expr
 parseCall = do
@@ -554,14 +517,14 @@ parseCall = do
     many ws
     args <- sepBy (char ',') parseExpr
     char ']'
-    pure $ call f args
+    pure $ CallExpr f args
 
 parseArray :: Parser Expr
 parseArray = do
     string "ARRAY["
     elems <- sepBy (char ',') parseExpr
     char ']'
-    pure $ arr elems
+    pure $ ArrayExpr elems
 
 parseIndex :: Parser Expr
 parseIndex = do
@@ -571,14 +534,14 @@ parseIndex = do
     many ws
     idx <- parseExpr
     char ']'
-    pure $ index idx array
+    pure $ IndexExpr idx array
 
 parseLength :: Parser Expr
 parseLength = do
     string "LENGTH["
     array <- parseExpr
     char ']'
-    pure $ lengthE array
+    pure $ LengthExpr array
 
 parseExpr :: Parser Expr
 parseExpr = parseInt <|> 
@@ -609,7 +572,7 @@ parseProgram :: Parser Program
 parseProgram = sepBy ws parseDefinition
 
 printF :: [Expr] -> Action Expr
-printF xs = liftIO (putStrLn $ intercalate " " $ map show xs) >> pure (int 0)
+printF xs = liftIO (putStrLn $ intercalate " " $ map show xs) >> pure (IntExpr 0)
 
 builtinFunctions :: [Expr]
 builtinFunctions = [Builtin "print" printF]
@@ -618,5 +581,5 @@ main :: IO ()
 main = do
     input <- getContents
     let parsed = runParser parseProgram input
-    let prog = maybe (error "parse error") (\(x, _) -> if null x then error "parse error" else x) parsed 
+        prog = maybe (error "parse error") (\(x, _) -> if null x then error "parse error" else x) parsed 
     evalStateT (run prog builtinFunctions) []
